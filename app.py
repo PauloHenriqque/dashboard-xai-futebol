@@ -6,6 +6,7 @@ import shap
 import matplotlib.pyplot as plt
 from mplsoccer import Pitch
 import warnings
+import io
 
 # Ocultando os avisos chatos do matplotlib
 warnings.filterwarnings('ignore')
@@ -21,9 +22,18 @@ st.title("⚽ Sistema de Apoio à Decisão Tática com IA Explicável (XAI)")
 st.markdown("---")
 
 # ==========================================
+# FUNÇÃO DE RENDERIZAÇÃO (CORREÇÃO DE BUG MATPLOTLIB)
+# ==========================================
+def render_matplotlib_fig(fig):
+    """Salva a figura em memória e exibe como imagem, evitando o bug do st.pyplot() no Python 3.13"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    st.image(buf)
+    plt.close(fig)
+
+# ==========================================
 # 1. DICIONÁRIO DE TRADUÇÃO PARA O USUÁRIO
 # ==========================================
-# Isso ensina o sistema a falar "futebolês" em vez de "tecniquês"
 dicionario_traducao = {
     'distancia_gol': 'Distância até o gol',
     'under_pressure': 'Pressão da marcação adversária',
@@ -36,22 +46,10 @@ dicionario_traducao = {
 }
 
 # ==========================================
-# 2. CARREGAMENTO DOS MODELOS TREINADOS (dados reais - Copa do Mundo 2022)
+# 2. CARREGAMENTO DOS MODELOS TREINADOS (.json)
 # ==========================================
-# Os modelos abaixo são os mesmos treinados no notebook (TCC__1_.ipynb),
-# com dados reais de eventos da StatsBomb (Copa do Mundo 2022). Nenhum dado
-# sintético é usado aqui: o app apenas carrega os modelos já treinados.
-#
-# Usamos o formato nativo do XGBoost (.json) em vez de pickle/.pkl.
-# O pickle serializa o buffer binário interno do Booster, e a própria
-# documentação do XGBoost não garante que isso seja portável entre
-# instalações/sistemas operacionais diferentes (foi exatamente essa a causa
-# do erro "input stream corrupted" ao mover os .pkl para outra máquina).
-# save_model()/load_model() é o método oficialmente suportado para
-# persistir modelos de forma portável.
 MODELO_XG_PATH = "modelo_xg_copa.json"
 MODELO_PASSE_PATH = "modelo_passe_copa.json"
-
 
 @st.cache_resource
 def carregar_modelos():
@@ -61,13 +59,11 @@ def carregar_modelos():
 
         modelo_passe = xgb.XGBClassifier()
         modelo_passe.load_model(MODELO_PASSE_PATH)
-    except (FileNotFoundError, xgb.core.XGBoostError) as e:
+    except Exception as e:
         st.error(
-            "❌ Não foi possível carregar os modelos treinados "
-            f"(`{MODELO_XG_PATH}` / `{MODELO_PASSE_PATH}`). "
-            "Verifique se os arquivos .json exportados pelo notebook estão "
-            "na mesma pasta do app.py.\n\n"
-            f"Detalhe técnico: {e}"
+            f"❌ Erro ao carregar os modelos. "
+            f"Verifique se `{MODELO_XG_PATH}` e `{MODELO_PASSE_PATH}` "
+            f"estão na mesma pasta do app.py.\n\nDetalhe técnico: {e}"
         )
         st.stop()
 
@@ -76,11 +72,8 @@ def carregar_modelos():
 
     return modelo_xg, explainer_xg, modelo_passe, explainer_passe
 
-
 modelo_xg, explainer_xg, modelo_passe, explainer_passe = carregar_modelos()
 
-# Colunas exatas esperadas por cada modelo, na ordem em que foram treinadas.
-# Isso evita erros de shape/ordem quando o XGBoost valida os nomes das features.
 COLUNAS_MODELO_XG = modelo_xg.get_booster().feature_names
 COLUNAS_MODELO_PASSE = modelo_passe.get_booster().feature_names
 
@@ -99,20 +92,13 @@ with aba_xg:
         y_chute = st.slider("Posição Y (Largura do Campo)", 0.0, 80.0, 40.0, key="xg_y")
         pressao_xg = st.checkbox("Sofrendo Pressão Defensiva?", value=False, key="xg_p")
 
-        # Pé Dominante vs Pé do Chute
         pe_dominante = st.selectbox("Pé Dominante do Jogador", ["Destro", "Canhoto"], key="xg_dom")
-        # As 4 categorias abaixo espelham exatamente as classes que o modelo
-        # aprendeu a partir do dado real (shot_body_part): Right Foot, Left
-        # Foot e Other são colunas explícitas do modelo; "Cabeça" é a
-        # categoria de referência (baseline), representada quando todas as
-        # dummies de pé ficam em zero.
         pe_chute = st.selectbox(
             "Pé/Parte do corpo usado na Finalização",
             ["Pé Direito", "Pé Esquerdo", "Cabeça", "Outra parte do corpo"],
             key="xg_body"
         )
 
-        # Engenharia de Recursos Espaciais (mesma fórmula do notebook)
         dist_gol = np.sqrt((120 - x_chute) ** 2 + (40 - y_chute) ** 2)
 
         linha_input_xg = {
@@ -122,28 +108,18 @@ with aba_xg:
             'shot_body_part_Left Foot': 1 if pe_chute == "Pé Esquerdo" else 0,
             'shot_body_part_Other': 1 if pe_chute == "Outra parte do corpo" else 0,
         }
-        # Reordena as colunas exatamente como o modelo foi treinado
+        
         input_xg = pd.DataFrame([linha_input_xg])[COLUNAS_MODELO_XG]
-
-        # Predição da IA (modelo real, treinado com dados da Copa 2022)
         prob_xg_ai = modelo_xg.predict_proba(input_xg)[0][1]
 
-        # ==========================================
         # REGRA DE NEGÓCIO ADICIONAL: FATOR DE PERNA RUIM
-        # ==========================================
-        # IMPORTANTE: esta penalidade NÃO faz parte do modelo estatístico nem
-        # do SHAP. É uma heurística de domínio aplicada por fora da IA, para
-        # simular o efeito conhecido de finalizar com a perna não dominante.
-        # O SHAP explica apenas a saída do modelo (prob_xg_ai); a leitura
-        # tática sobre "perna dominante x perna do chute" é textual e
-        # separada, para não ser confundida com uma explicação do modelo.
-        fator_penalidade = 1.0  # 1.0 = sem penalidade (100% do valor)
+        fator_penalidade = 1.0  
         usou_perna_ruim = False
 
         if pe_chute in ("Pé Direito", "Pé Esquerdo"):
             if (pe_dominante == "Destro" and pe_chute == "Pé Esquerdo") or \
                (pe_dominante == "Canhoto" and pe_chute == "Pé Direito"):
-                fator_penalidade = 0.65  # reduz a chance de gol em 35%
+                fator_penalidade = 0.65  
                 usou_perna_ruim = True
 
         prob_xg_final = prob_xg_ai * fator_penalidade
@@ -155,32 +131,31 @@ with aba_xg:
             st.warning(
                 f"⚠️ **Heurística aplicada (fora do modelo):** finalização com a perna não "
                 f"dominante. O xG do modelo ({prob_xg_ai * 100:.1f}%) foi reduzido em 35% "
-                f"por essa regra de domínio, não pelo SHAP."
+                f"por essa regra de domínio."
             )
 
         st.caption(f"Distância Calculada: **{dist_gol:.1f} unidades**")
 
     with col2:
-        # Campo de Futebol 2D
         fig_pitch, ax_pitch = plt.subplots(figsize=(8, 4.5))
         pitch = Pitch(pitch_type='statsbomb', pitch_color='#22312b', line_color='#c7d5cc')
         pitch.draw(ax=ax_pitch)
+        
+        ax_pitch.text(30, 40, "DEFESA", color='white', ha='center', va='center', alpha=0.15, fontsize=24, fontweight='bold')
+        ax_pitch.text(90, 40, "ATAQUE", color='white', ha='center', va='center', alpha=0.15, fontsize=24, fontweight='bold')
+        ax_pitch.annotate("", xy=(85, 75), xytext=(35, 75), arrowprops=dict(arrowstyle="->", color="white", alpha=0.4, lw=2))
+        ax_pitch.text(60, 72, "Sentido do Jogo", color='white', ha='center', va='center', alpha=0.4, fontsize=10)
+        
         pitch.scatter(x_chute, y_chute, ax=ax_pitch, s=200, color='red', edgecolors='black', zorder=3)
         fig_pitch.patch.set_facecolor('#22312b')
-        st.pyplot(fig_pitch)
+        render_matplotlib_fig(fig_pitch) 
 
         st.write("---")
         st.subheader("💡 Leitura Tática da Inteligência Artificial")
 
-        # Cálculo dos valores SHAP em tempo real (uma única vez)
         shap_val = explainer_xg(input_xg)
         idx_dist = COLUNAS_MODELO_XG.index('distancia_gol')
-        idx_pressao = COLUNAS_MODELO_XG.index('under_pressure')
-
-        # 1. Explicação da Distância
-        # Limiares (+-0.15) são um recorte heurístico para narrativa textual,
-        # baseado na ordem de grandeza observada dos valores SHAP na base de
-        # teste do notebook; não são um critério estatístico formal.
+        
         shap_dist = shap_val[0].values[idx_dist]
         if shap_dist > 0.15:
             st.success("✅ **Proximidade do Gol**: Excelente posicionamento, muito próximo da baliza!")
@@ -191,45 +166,26 @@ with aba_xg:
         else:
             st.warning("📉 **Distância do Gol**: Distância intermediária, exige alta precisão do chute.")
 
-        # 2. Explicação da Pressão Defensiva
         if pressao_xg:
             st.error("⚠️ **Pressão Defensiva**: Marcador próximo reduz o tempo de reação e a precisão da jogada.")
         else:
             st.success("✅ **Espaço Livre**: Finalizador sem pressão defensiva direta.")
 
-        # 3. Leitura textual sobre Pé Dominante vs Pé do Chute
-        # (Nota: essa leitura descreve a heurística de negócio acima, não um
-        # valor SHAP — o modelo em si só sabe se foi Right Foot/Left
-        # Foot/Other/Cabeça, não sabe qual é o pé "dominante" do jogador.)
         if pe_chute == "Cabeça":
             st.info("ℹ️ **Tipo de Finalização**: Cabeceio.")
         elif pe_chute == "Outra parte do corpo":
             st.info("ℹ️ **Tipo de Finalização**: Outra parte do corpo (ex: peito, coxa).")
         else:
             if usou_perna_ruim:
-                st.error(
-                    f"⚠️ **Biomecânica do Chute**: Jogador é **{pe_dominante}**, mas finalizou "
-                    f"com o **{pe_chute.lower()}** (perna não dominante). Isso reduz a precisão "
-                    f"e a força do impacto."
-                )
+                st.error(f"⚠️ **Biomecânica do Chute**: Jogador é **{pe_dominante}**, mas finalizou com o **{pe_chute.lower()}** (perna não dominante). Isso reduz a precisão e a força do impacto.")
             else:
-                st.success(
-                    f"✅ **Biomecânica do Chute**: Finalização realizada com a perna dominante "
-                    f"(**{pe_dominante}**), garantindo melhor controle e potência."
-                )
+                st.success(f"✅ **Biomecânica do Chute**: Finalização realizada com a perna dominante (**{pe_dominante}**), garantindo melhor controle e potência.")
 
-        # Menu retrátil com o gráfico técnico do SHAP
         with st.expander("📊 Ver Gráfico Técnico SHAP (Modo Analista)"):
-            st.markdown(
-                "Decomposição detalhada das contribuições marginais do modelo XGBoost "
-                "(valores SHAP calculados sobre a probabilidade bruta do modelo, **antes** "
-                "da heurística de perna ruim, que não faz parte do modelo):"
-            )
-            plt.clf()
+            st.markdown("Decomposição detalhada das contribuições marginais do modelo XGBoost:")
+            fig_shap = plt.figure(figsize=(8, 4))
             shap.plots.waterfall(shap_val[0], show=False)
-            fig_shap = plt.gcf()
-            fig_shap.set_size_inches(8, 4)
-            st.pyplot(fig_shap)
+            render_matplotlib_fig(fig_shap) 
 
 # ==========================================
 # 4. ABA 2: SIMULADOR DE PASSES
@@ -257,21 +213,24 @@ with aba_passe:
         st.metric(label="🎯 Probabilidade de Sucesso", value=f"{prob_p * 100:.1f}%")
 
     with col2_p:
-        # Campo de Futebol
-        fig_p, ax_p = plt.subplots(figsize=(8, 5))
+        fig_p, ax_p = plt.subplots(figsize=(8, 4.5))
         pitch_p = Pitch(pitch_type='statsbomb', pitch_color='#22312b', line_color='#c7d5cc')
         pitch_p.draw(ax=ax_p)
+        
+        ax_p.text(30, 40, "DEFESA", color='white', ha='center', va='center', alpha=0.15, fontsize=24, fontweight='bold')
+        ax_p.text(90, 40, "ATAQUE", color='white', ha='center', va='center', alpha=0.15, fontsize=24, fontweight='bold')
+        ax_p.annotate("", xy=(85, 75), xytext=(35, 75), arrowprops=dict(arrowstyle="->", color="white", alpha=0.4, lw=2))
+        ax_p.text(60, 72, "Sentido do Jogo", color='white', ha='center', va='center', alpha=0.4, fontsize=10)
+        
         pitch_p.scatter(x_pass, y_pass, ax=ax_p, s=150, color='blue', edgecolors='white', zorder=3)
         fig_p.patch.set_facecolor('#22312b')
-        st.pyplot(fig_p)
+        render_matplotlib_fig(fig_p) 
 
         st.write("---")
         st.subheader("💡 Leitura Tática da Inteligência Artificial")
 
-        # Pega os valores matemáticos do SHAP
         shap_val_p = explainer_passe(input_p)
 
-        # Traduz os valores para mensagens visuais
         for col, shap_v in zip(input_p.columns, shap_val_p[0].values):
             nome_amigavel = dicionario_traducao.get(col, col)
             if shap_v > 0.15:
@@ -283,11 +242,8 @@ with aba_passe:
             else:
                 st.warning(f"📉 **{nome_amigavel}**: Aumentou levemente o risco de interceptação.")
 
-        # Esconde o gráfico complexo
         with st.expander("📊 Ver Gráfico Técnico SHAP (Modo Cientista de Dados)"):
             st.markdown("Análise marginal do impacto estatístico das coordenadas no sucesso do passe.")
-            plt.clf()
+            fig_shap_p = plt.figure(figsize=(8, 4))
             shap.plots.waterfall(shap_val_p[0], show=False)
-            fig_shap_p = plt.gcf()
-            fig_shap_p.set_size_inches(8, 4)
-            st.pyplot(fig_shap_p)
+            render_matplotlib_fig(fig_shap_p)
